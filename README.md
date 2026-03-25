@@ -33,6 +33,18 @@ flowchart LR
   Conn --> OSConn[openstacksdk Connection]
 ```
 
+## Request Flow (Nova Execution)
+
+```mermaid
+flowchart TD
+  C[Client] -->|Authorization: Bearer <KEYSTONE_TOKEN>| F[FastAPI]
+  F -->|Routes to `POST /v1/servers`| R[Router: `app/api/routers/servers.py`]
+  R --> D[Dependency: `get_vm_service()`]
+  D --> K[Keystoneauth1: builds token-auth session]
+  K --> O[openstacksdk: creates authenticated `Connection`]
+  O --> N[Nova (compute service): create/start/stop/delete server]
+```
+
 ### Module breakdown
 - `app/main.py`: app wiring (includes routers)
 - `app/api/routers/servers.py`: the 4 HTTP endpoints (Swagger-documented)
