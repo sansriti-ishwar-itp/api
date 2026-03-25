@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import HTTPException, status
 from openstack import exceptions as os_exc
 
-
+#maps openstacksdk exceptions to appropriate HTTPException for API responses
 def openstack_exception_to_http(exc: Exception) -> HTTPException:
     if isinstance(exc, os_exc.NotFoundException):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Server not found")

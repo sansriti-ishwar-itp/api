@@ -20,4 +20,5 @@ openstack_vm_api.egg-info/SOURCES.txt
 openstack_vm_api.egg-info/dependency_links.txt
 openstack_vm_api.egg-info/requires.txt
 openstack_vm_api.egg-info/top_level.txt
+tests/test_health_endpoint.py
 tests/test_servers_endpoints.py

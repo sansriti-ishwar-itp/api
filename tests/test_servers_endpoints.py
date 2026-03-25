@@ -8,6 +8,9 @@ from app.api.deps.openstack import get_vm_service
 from app.main import app
 from app.models.responses import CreateServerResponse, VmActionResponse
 
+# Router-level Security(bearer_scheme) still runs when get_vm_service is overridden.
+_AUTH_HEADERS = {"Authorization": "Bearer test-token"}
+
 
 class FakeVMService:
     def __init__(self) -> None:
@@ -50,22 +53,22 @@ def test_create_start_stop_delete_endpoints() -> None:
         "networks": [{"uuid": "net-1"}],
     }
 
-    resp = client.post("/v1/servers", json=create_payload)
+    resp = client.post("/v1/servers", json=create_payload, headers=_AUTH_HEADERS)
     assert resp.status_code == 201
     assert resp.json() == {"server_id": "vm-123", "status": "BUILD"}
     assert fake.created_attrs == create_payload
 
-    resp = client.post("/v1/servers/vm-123/start")
+    resp = client.post("/v1/servers/vm-123/start", headers=_AUTH_HEADERS)
     assert resp.status_code == 202
     assert resp.json() == {"server_id": "vm-123", "action": "start"}
     assert fake.started_server_id == "vm-123"
 
-    resp = client.post("/v1/servers/vm-123/stop")
+    resp = client.post("/v1/servers/vm-123/stop", headers=_AUTH_HEADERS)
     assert resp.status_code == 202
     assert resp.json() == {"server_id": "vm-123", "action": "stop"}
     assert fake.stopped_server_id == "vm-123"
 
-    resp = client.delete("/v1/servers/vm-123?force=true")
+    resp = client.delete("/v1/servers/vm-123?force=true", headers=_AUTH_HEADERS)
     assert resp.status_code == 204
     assert resp.content == b""
     assert fake.deleted_server_id == "vm-123"

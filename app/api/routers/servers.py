@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Response, Security
 
-from app.api.deps.openstack import get_vm_service
+from app.api.deps.openstack import bearer_scheme, get_vm_service
 from app.models.requests import CreateServerRequest
 from app.models.responses import CreateServerResponse, VmActionResponse
 from app.services.vm_service import VMService
 
-router = APIRouter(prefix="/v1", tags=["servers"])
+# Security on the router so OpenAPI/Swagger shows the lock and sends Authorization on Try it out.
+router = APIRouter(
+    prefix="/v1",
+    tags=["servers"],
+    dependencies=[Security(bearer_scheme)],
+)
 
 
 @router.post(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Annotated, Optional
 
 from fastapi import Depends, HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -14,7 +14,16 @@ from app.core.config import Settings, get_settings
 from app.services.openstack_client import OpenStackVMClient
 from app.services.vm_service import VMService
 
-bearer_scheme = HTTPBearer(auto_error=True)
+# auto_error=False: return None when the header is missing so we can return a clear 401
+# (HTTPBearer(auto_error=True) yields 403 "Not authenticated", which confuses Swagger users).
+bearer_scheme = HTTPBearer(
+    auto_error=False,
+    description=(
+        "Keystone token from: openstack token issue -f value -c id. "
+        "Paste the token only (Swagger adds the Bearer prefix). "
+        "If you pasted 'Bearer …' by mistake, it is accepted too."
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -23,19 +32,41 @@ class OpenStackContext:
     ks_session: ks_session.Session
 
 
+def _normalize_raw_token(value: str) -> str:
+    """Strip whitespace and accidental duplicate 'Bearer ' prefix (common in Swagger)."""
+    t = value.strip()
+    lower = t.lower()
+    if lower.startswith("bearer "):
+        t = t[7:].strip()
+    return t
+
+
 def _token_from_credentials(
     credentials: HTTPAuthorizationCredentials,
 ) -> str:
-    if not credentials.scheme.lower() == "bearer":
-        # HTTPBearer only parses the scheme/value; we still enforce Bearer semantics.
+    if credentials.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="Invalid authorization scheme")
-    return credentials.credentials
+    token = _normalize_raw_token(credentials.credentials)
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Empty bearer token after Authorization header",
+        )
+    return token
 
 
 def get_openstack_context(
-    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
-    settings: Settings = Depends(get_settings),
+    credentials: Annotated[Optional[HTTPAuthorizationCredentials], Security(bearer_scheme)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> OpenStackContext:
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Missing Authorization header. Use: Authorization: Bearer <keystone_token>. "
+                "In Swagger (/docs): click Authorize, paste the token only, then Execute."
+            ),
+        )
     token = _token_from_credentials(credentials)
 
     # Use keystoneauth1's "Token" plugin to authenticate via an existing Keystone token.
@@ -50,7 +81,9 @@ def get_openstack_context(
     if settings.openstack_project_id:
         auth_kwargs["project_id"] = settings.openstack_project_id
     if settings.openstack_user_domain_id:
-        auth_kwargs["user_domain_id"] = settings.openstack_user_domain_id
+        # keystoneauth1's v3.Token uses `domain_id`/`domain_name` (not `user_domain_id`).
+        # Keep our Settings naming for backward compatibility, but map to the SDK arg.
+        auth_kwargs["domain_id"] = settings.openstack_user_domain_id
     if settings.openstack_project_domain_id:
         auth_kwargs["project_domain_id"] = settings.openstack_project_domain_id
 
@@ -73,4 +106,3 @@ def get_openstack_context(
 def get_vm_service(ctx: OpenStackContext = Depends(get_openstack_context)) -> VMService:
     client = OpenStackVMClient(conn=ctx.conn, ks_session=ctx.ks_session)
     return VMService(client=client)
-

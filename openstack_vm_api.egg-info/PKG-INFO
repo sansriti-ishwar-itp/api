@@ -24,10 +24,11 @@ This repository contains a modular **FastAPI** proof-of-concept that manages **O
 
 ## MVP Endpoints (Swagger)
 
-All endpoints require a Keystone token (see authentication).
+VM lifecycle endpoints require a Keystone token (see authentication). Health checks do not.
 
 | Method & Path | Meaning |
 |---|---|
+| `GET /health` | Health check |
 | `POST /v1/servers` | Create a VM (OpenStack server) |
 | `POST /v1/servers/{server_id}/start` | Start a VM |
 | `POST /v1/servers/{server_id}/stop` | Stop a VM |
@@ -50,6 +51,18 @@ flowchart LR
   API --> AuthDep[Auth dependency]
   AuthDep --> Conn[keystoneauth1 Session]
   Conn --> OSConn[openstacksdk Connection]
+```
+
+## Request Flow (Nova Execution)
+
+```mermaid
+flowchart TD
+  C[Client] -->|Authorization: Bearer <KEYSTONE_TOKEN>| F[FastAPI]
+  F -->|Routes to `POST /v1/servers`| R[Router: `app/api/routers/servers.py`]
+  R --> D[Dependency: `get_vm_service()`]
+  D --> K[Keystoneauth1: builds token-auth session]
+  K --> O[openstacksdk: creates authenticated `Connection`]
+  O --> N[Nova (compute service): create/start/stop/delete server]
 ```
 
 ### Module breakdown
