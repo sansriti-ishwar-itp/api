@@ -9,3 +9,13 @@ app = FastAPI(
 
 app.include_router(servers_router)
 
+
+@app.get(
+    "/health",
+    tags=["health"],
+    summary="Health check",
+)
+def health() -> dict[str, str]:
+    # Deliberately does not touch OpenStack/auth dependencies.
+    return {"status": "ok"}
+

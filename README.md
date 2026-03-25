@@ -5,10 +5,11 @@ This repository contains a modular **FastAPI** proof-of-concept that manages **O
 
 ## MVP Endpoints (Swagger)
 
-All endpoints require a Keystone token (see authentication).
+VM lifecycle endpoints require a Keystone token (see authentication). Health checks do not.
 
 | Method & Path | Meaning |
 |---|---|
+| `GET /health` | Health check |
 | `POST /v1/servers` | Create a VM (OpenStack server) |
 | `POST /v1/servers/{server_id}/start` | Start a VM |
 | `POST /v1/servers/{server_id}/stop` | Stop a VM |
