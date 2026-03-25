@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+openstacksdk
+keystoneauth1
+pydantic
+pydantic-settings
+
+[dev]
+pytest
+httpx
+pytest-cov
