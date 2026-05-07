@@ -1,0 +1,274 @@
+Metadata-Version: 2.4
+Name: openstack-vm-api
+Version: 0.2.0
+Summary: Disaster Recovery orchestration platform for OpenStack VM lifecycle (FastAPI)
+Author: Assessment Prototype
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi<0.116,>=0.110
+Requires-Dist: uvicorn[standard]<0.33,>=0.29
+Requires-Dist: openstacksdk<5.0,>=3.0
+Requires-Dist: keystoneauth1<6.0,>=5.6
+Requires-Dist: pydantic<3.0,>=2.6
+Requires-Dist: pydantic-settings<3.0,>=2.2
+Requires-Dist: sqlalchemy[asyncio]<2.1,>=2.0
+Requires-Dist: greenlet<4.0,>=3.0
+Requires-Dist: aiosqlite<1.0,>=0.19
+Requires-Dist: tenacity<10.0,>=8.2
+Requires-Dist: prometheus-fastapi-instrumentator<8.0,>=7.0
+Requires-Dist: python-json-logger<4.0,>=2.0
+Provides-Extra: dev
+Requires-Dist: pytest<9.0,>=8.0; extra == "dev"
+Requires-Dist: pytest-asyncio<1.0,>=0.23; extra == "dev"
+Requires-Dist: pytest-cov<7.0,>=5.0; extra == "dev"
+Requires-Dist: httpx<1.0,>=0.27; extra == "dev"
+Requires-Dist: ruff<1.0,>=0.4; extra == "dev"
+Requires-Dist: black<26.0,>=24.0; extra == "dev"
+Requires-Dist: mypy<2.0,>=1.8; extra == "dev"
+Requires-Dist: pre-commit<5.0,>=3.6; extra == "dev"
+
+# Disaster Recovery Orchestration Platform for OpenStack (FastAPI)
+
+Automates disaster-recovery (DR) decisioning and execution for OpenStack VMs using an explicit **state machine**, a durable **audit log**, and a **job-based** async API.
+
+This repo includes:
+- A **DR control plane** (`/v1/vms`, `/v1/dr/*`, `/v1/audit`) that tracks VMs, health probes, snapshots, and DR jobs.
+- A **raw OpenStack lifecycle** router (`/v1/servers`) that proxies a Keystone bearer token to OpenStack for create/start/stop/delete.
+- A **mock adapter** for end-to-end local runs without OpenStack.
+
+
+## Problem statement
+
+Enterprises running large OpenStack fleets often recover VMs manually:
+- Alerts arrive late, triage is manual, and recovery steps are error-prone (snapshot, stop, boot on standby, validate).
+- Downtime is typically **45–90 minutes**, but common SLAs require **~15 minutes** RTO.
+
+**Goal:** Provide an automated DR pipeline that detects failures, drives a VM through recovery states, records an audit trail for every step, and exposes a safe async API for operators/integrations.
+
+
+## Architecture diagram (actual)
+
+### High-level components (control plane)
+
+```
+                    +--------------------+
+                    |      Client        |
+                    | (Ops / CI / UI)    |
+                    +---------+----------+
+                              |
+                              | HTTP (OpenAPI /docs)
+                              v
+                    +--------------------+
+                    |  FastAPI app       |
+                    |  app/main.py       |
+                    +----+----------+----+
+                         |          |
+                         |          |
+                         |          +-------------------------------+
+                         |                                          |
+                         v                                          v
+            +-----------------------+                  +-----------------------+
+            | DR control plane      |                  | Raw OpenStack proxy   |
+            | /v1/vms /v1/dr /audit |                  | /v1/servers           |
+            +-----------+-----------+                  +-----------+-----------+
+                        |                                          |
+                        | writes state + audit                      | uses Keystone token
+                        v                                          v
+            +-----------------------+                  +-----------------------+
+            | Async DB (SQLAlchemy) |                  | keystoneauth1 Session |
+            | VM / DRJob / Audit    |                  | + openstacksdk Conn   |
+            +-----------+-----------+                  +-----------+-----------+
+                        |                                          |
+                        | job runner                                | OpenStack API
+                        v                                          v
+            +-----------------------+                     +--------------------+
+            | DR Orchestrator       |                     | OpenStack services |
+            | state_machine + retry |                     | (Nova/Glance/etc.) |
+            +-----------------------+                     +--------------------+
+```
+
+### Execution path (DR job)
+
+```
+POST /v1/vms/{vm_id}/dr/trigger  -> 202 Accepted + job_id
+                                      |
+                                      v
+                              Background job runner
+                                      |
+                                      v
+ FAILING -> SNAPSHOTTING -> MIGRATING -> RESTORING -> RECOVERED
+   |            |              |             |
+   |            |              |             +-- ping/verify
+   |            |              +-- stop source VM
+   |            +-- create snapshot
+   +-- audit + SLA tracking at each step
+```
+
+Notes:
+- The MVP runs the pipeline via **FastAPI `BackgroundTasks`** (single-process async).
+- The code is structured so Phase 2 can swap in **Celery + Redis** without changing the HTTP contract.
+
+
+## API overview
+
+OpenAPI docs:
+- Swagger UI: `GET /docs`
+- OpenAPI JSON: `GET /openapi.json`
+
+### DR control-plane endpoints (core)
+
+- **Register/list VMs**
+  - `GET /v1/vms`
+  - `POST /v1/vms`
+  - `GET /v1/vms/{vm_id}`
+  - `DELETE /v1/vms/{vm_id}`
+- **Health probes**
+  - `POST /v1/vms/{vm_id}/health-check`
+- **Snapshots**
+  - `POST /v1/vms/{vm_id}/snapshot`
+  - `GET /v1/vms/{vm_id}/snapshots`
+- **DR jobs**
+  - `POST /v1/vms/{vm_id}/dr/trigger` → `202 Accepted` with `job_id` (idempotent replay)
+  - `GET /v1/dr/jobs/{job_id}` → poll job status
+  - `POST /v1/dr/jobs/{job_id}/abort` → request abort
+  - `GET /v1/dr/jobs` → list recent jobs
+- **Audit**
+  - `GET /v1/vms/{vm_id}/audit`
+  - `GET /v1/audit`
+
+### Raw OpenStack lifecycle endpoints (token-proxy)
+
+These require `Authorization: Bearer <KEYSTONE_TOKEN>`:
+- `POST /v1/servers`
+- `POST /v1/servers/{server_id}/start`
+- `POST /v1/servers/{server_id}/stop`
+- `DELETE /v1/servers/{server_id}`
+
+
+## Local development (recommended for interview review)
+
+### Install
+
+```bash
+py -m venv .venv
+```
+
+Activate venv (PowerShell):
+
+```bash
+.\.venv\Scripts\Activate.ps1
+```
+
+Install (uses `uv`):
+
+```bash
+uv pip install -e ".[dev]"
+```
+
+### Run
+
+Run in mock mode (default):
+
+```bash
+set ADAPTER_MODE=mock
+uvicorn app.main:app --reload --port 8000
+```
+
+Or with Docker:
+
+```bash
+docker compose up --build
+```
+
+### Test
+
+```bash
+pytest
+```
+
+
+## What’s implemented well (and why it matters)
+
+- **Explicit state machine (`app/core/state_machine.py`)**
+  - State transitions are validated; illegal transitions throw immediately.
+  - Avoids “stringly-typed” state bugs and makes DR decisions auditable.
+- **Job-based async DR API**
+  - `POST /v1/vms/{vm_id}/dr/trigger` returns **`202 Accepted`** with a `job_id` and a poll endpoint.
+  - **Idempotency**: triggering while a job is running returns the existing job (no duplicate pipelines).
+- **Audit trail is first-class**
+  - Every mutation (registration, health transitions, DR steps, abort requests) records an `AuditEvent`.
+  - Request correlation via `X-Request-ID` propagates into audits and logs.
+- **Retry/backoff for flaky infrastructure**
+  - Adapter operations are executed with retry logic (`app/core/retry.py`) to tolerate transient OpenStack errors.
+- **Runs end-to-end without OpenStack**
+  - `ADAPTER_MODE=mock` provides realistic latency + deterministic failure injection for tests and demos.
+- **Separation of concerns**
+  - Routers are thin; orchestration logic is isolated; adapter abstracts OpenStack vs mock.
+
+
+## Limitations (intentional for MVP)
+
+- **Health monitor auto-trigger is not a background scheduler yet**
+  - Health probes can be triggered via API; there is not yet a Celery beat / cron loop that checks all VMs.
+- **BackgroundTasks is not survivable across restarts**
+  - If the process restarts mid-DR, the in-flight background job is lost (DB state remains).
+- **No distributed locking**
+  - In a multi-worker deployment, two workers could trigger DR for the same VM without a lock.
+- **OpenStack “ping” is best-effort in real mode**
+  - `OpenStackAdapter.ping_vm()` currently checks server status; a real probe should hit an app port (HTTP/SSH) or a health agent.
+- **Network reroute (DNS/LB) not implemented**
+  - The orchestration focuses on snapshot/stop/boot/verify; traffic switching is a Phase 2/3 integration.
+- **Data-plane decisions are simplified**
+  - Standby selection uses a best-effort heuristic; policy/cost/affinity rules are not implemented.
+
+
+## Future plan (how this becomes production-grade)
+
+### Phase 2: Durable async pipeline
+
+- **Celery + Redis job runner**
+  - Replace FastAPI `BackgroundTasks` with Celery workers so DR jobs survive restarts.
+  - Keep the same HTTP contract (`202 + job_id + poll`).
+- **PostgreSQL**
+  - Swap SQLite demo DB for Postgres (`asyncpg`) in deployment.
+
+### Phase 3: Automated detection + safety
+
+- **Scheduled health monitor**
+  - Celery beat task (or external scheduler) to run periodic probes for all registered VMs.
+  - Threshold-based transitions (HEALTHY → SUSPECT → FAILING) and auto-trigger DR.
+- **Distributed lock**
+  - Redis lock keyed by VM id so only one DR pipeline can run per VM across workers.
+- **Richer readiness/health**
+  - Add optional agent-based probes or configurable TCP/HTTP probes per VM.
+
+### Phase 4: Operational integrations
+
+- **DNS / load balancer updates**
+  - Integrate Octavia/Neutron or external DNS/LB systems to shift traffic to recovered VM.
+- **Policy engine**
+  - Per-VM rules: approval required, DR allowed windows, max cost, preferred standby pools.
+- **Observability**
+  - Metrics per state/job, RTO breach counters, dashboard-ready audit queries.
+- **Security / RBAC**
+  - Enforce role-based permissions and project scoping beyond “token proxy”.
+
+
+## Environment variables (high signal)
+
+- `ADAPTER_MODE`: `mock` (default) or `openstack`
+- `DATABASE_URL`: defaults to SQLite in docker-compose; set for real deployments
+- `DEFAULT_RTO_MINUTES`: default RTO for newly-registered VMs
+- `MOCK_LATENCY_MS`: mock adapter latency tuning
+- `OPENSTACK_AUTH_URL`: required for `ADAPTER_MODE=openstack` token-proxy mode
+
+
+## Key references in the codebase
+
+- **API wiring**: `app/main.py`
+- **DR orchestrator**: `app/core/orchestrator.py`
+- **State machine**: `app/core/state_machine.py`
+- **Adapters**: `app/adapters/mock.py`, `app/adapters/openstack.py`, `app/adapters/factory.py`
+- **Routers**: `app/api/routers/vms.py`, `app/api/routers/dr.py`, `app/api/routers/audit.py`, `app/api/routers/health.py`, `app/api/routers/servers.py`
+

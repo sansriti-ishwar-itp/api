@@ -1,126 +1,154 @@
-# OpenStack VM Lifecycle API (Proof of Concept)
+# Disaster Recovery Orchestration Platform for OpenStack (FastAPI)
 
-This repository contains a modular **FastAPI** proof-of-concept that manages **OpenStack VM lifecycle** operations.
+Automates disaster-recovery (DR) decisioning and execution for OpenStack VMs using an explicit **state machine**, a durable **audit log**, and a **job-based** async API.
+
+This repo includes:
+- A **DR control plane** (`/v1/vms`, `/v1/dr/*`, `/v1/audit`) that tracks VMs, health probes, snapshots, and DR jobs.
+- A **raw OpenStack lifecycle** router (`/v1/servers`) that proxies a Keystone bearer token to OpenStack for create/start/stop/delete.
+- A **mock adapter** for end-to-end local runs without OpenStack.
 
 
-## MVP Endpoints (Swagger)
+## Problem statement
 
-VM lifecycle endpoints require a Keystone token (see authentication). Health checks do not.
+Enterprises running large OpenStack fleets often recover VMs manually:
+- Alerts arrive late, triage is manual, and recovery steps are error-prone (snapshot, stop, boot on standby, validate).
+- Downtime is typically **45–90 minutes**, but common SLAs require **~15 minutes** RTO.
 
-| Method & Path | Meaning |
-|---|---|
-| `GET /health` | Health check |
-| `POST /v1/servers` | Create a VM (OpenStack server) |
-| `POST /v1/servers/{server_id}/start` | Start a VM |
-| `POST /v1/servers/{server_id}/stop` | Stop a VM |
-| `DELETE /v1/servers/{server_id}` | Delete a VM |
+**Goal:** Provide an automated DR pipeline that detects failures, drives a VM through recovery states, records an audit trail for every step, and exposes a safe async API for operators/integrations.
+
+
+## Architecture diagram
+
+### High-level components (control plane)
+
+```
+                    +--------------------+
+                    |      Client        |
+                    | (Ops / CI / UI)    |
+                    +---------+----------+
+                              |
+                              | HTTP (OpenAPI /docs)
+                              v
+                    +--------------------+
+                    |  FastAPI app       |
+                    |  app/main.py       |
+                    +----+----------+----+
+                         |          |
+                         |          |
+                         |          +-------------------------------+
+                         |                                          |
+                         v                                          v
+            +-----------------------+                  +-----------------------+
+            | DR control plane      |                  | Raw OpenStack proxy   |
+            | /v1/vms /v1/dr /audit |                  | /v1/servers           |
+            +-----------+-----------+                  +-----------+-----------+
+                        |                                          |
+                        | writes state + audit                      | uses Keystone token
+                        v                                          v
+            +-----------------------+                  +-----------------------+
+            | Async DB (SQLAlchemy) |                  | keystoneauth1 Session |
+            | VM / DRJob / Audit    |                  | + openstacksdk Conn   |
+            +-----------+-----------+                  +-----------+-----------+
+                        |                                          |
+                        | job runner                                | OpenStack API
+                        v                                          v
+            +-----------------------+                     +--------------------+
+            | DR Orchestrator       |                     | OpenStack services |
+            | state_machine + retry |                     | (Nova/Glance/etc.) |
+            +-----------------------+                     +--------------------+
+```
+
+### Execution path (DR job)
+
+```
+POST /v1/vms/{vm_id}/dr/trigger  -> 202 Accepted + job_id
+                                      |
+                                      v
+                              Background job runner
+                                      |
+                                      v
+ FAILING -> SNAPSHOTTING -> MIGRATING -> RESTORING -> RECOVERED
+   |            |              |             |
+   |            |              |             +-- ping/verify
+   |            |              +-- stop source VM
+   |            +-- create snapshot
+   +-- audit + SLA tracking at each step
+```
+
+Notes:
+- The MVP runs the pipeline via **FastAPI `BackgroundTasks`** (single-process async).
+- The code is structured so Phase 2 can swap in **Celery + Redis** without changing the HTTP contract.
+
+
+## API overview
 
 OpenAPI docs:
-- Swagger: `GET /docs`
+- Swagger UI: `GET /docs`
 - OpenAPI JSON: `GET /openapi.json`
 
-## Architecture (Modular)
+### DR control-plane endpoints (core)
 
-```mermaid
-flowchart LR
-  Client[Client] -->|HTTP + Authorization Bearer token| API[FastAPI]
-  API --> Router[APIRouter: servers]
-  Router --> Svc[VMService]
-  Svc --> OSClient[OpenStackVMClient]
-  OSClient --> OpenStack[OpenStack SDK compute + server actions]
+- **Register/list VMs**
+  - `GET /v1/vms`
+  - `POST /v1/vms`
+  - `GET /v1/vms/{vm_id}`
+  - `DELETE /v1/vms/{vm_id}`
+- **Health probes**
+  - `POST /v1/vms/{vm_id}/health-check`
+- **Snapshots**
+  - `POST /v1/vms/{vm_id}/snapshot`
+  - `GET /v1/vms/{vm_id}/snapshots`
+- **DR jobs**
+  - `POST /v1/vms/{vm_id}/dr/trigger` → `202 Accepted` with `job_id` (idempotent replay)
+  - `GET /v1/dr/jobs/{job_id}` → poll job status
+  - `POST /v1/dr/jobs/{job_id}/abort` → request abort
+  - `GET /v1/dr/jobs` → list recent jobs
+- **Audit**
+  - `GET /v1/vms/{vm_id}/audit`
+  - `GET /v1/audit`
 
-  API --> AuthDep[Auth dependency]
-  AuthDep --> Conn[keystoneauth1 Session]
-  Conn --> OSConn[openstacksdk Connection]
-```
+### Raw OpenStack lifecycle endpoints (token-proxy)
 
-## Request Flow (Nova Execution)
-
-```mermaid
-flowchart TD
-  C[Client] -->|Authorization: Bearer <KEYSTONE_TOKEN>| F[FastAPI]
-  F -->|Routes to `POST /v1/servers`| R[Router: `app/api/routers/servers.py`]
-  R --> D[Dependency: `get_vm_service()`]
-  D --> K[Keystoneauth1: builds token-auth session]
-  K --> O[openstacksdk: creates authenticated `Connection`]
-  O --> N[Nova (compute service): create/start/stop/delete server]
-```
-
-### Module breakdown
-- `app/main.py`: app wiring (includes routers)
-- `app/api/routers/servers.py`: the 4 HTTP endpoints (Swagger-documented)
-- `app/api/deps/openstack.py`: security dependency that builds an authenticated OpenStack connection from the caller’s Keystone token
-- `app/services/openstack_client.py`: thin wrapper over the OpenStack SDK (keeps OpenStack calls out of the HTTP layer)
-- `app/services/vm_service.py`: domain/service layer that exposes the API contract
-- `app/models/requests.py`, `app/models/responses.py`: Pydantic request/response shapes
-- `app/core/config.py`: environment-driven configuration
-- `app/core/errors.py`: mapping OpenStack SDK exceptions to HTTP status codes
-
-## Endpoint Contract -> OpenStack SDK Mapping
-
-This is the key “design choice” for transparency:
-
+These require `Authorization: Bearer <KEYSTONE_TOKEN>`:
 - `POST /v1/servers`
-  - Request body: a JSON object passed through as-is to `openstacksdk` create kwargs
-  - Implementation: `conn.compute.create_server(**attrs)`
-  - Response: best-effort `server_id` and `status`
-
 - `POST /v1/servers/{server_id}/start`
-  - Implementation: `conn.compute.get_server(server_id).start(keystone_session)`
-  - Response: `202 Accepted` with `{ "server_id", "action": "start" }`
-
 - `POST /v1/servers/{server_id}/stop`
-  - Implementation: `conn.compute.get_server(server_id).stop(keystone_session)`
-  - Response: `202 Accepted` with `{ "server_id", "action": "stop" }`
+- `DELETE /v1/servers/{server_id}`
 
-- `DELETE /v1/servers/{server_id}?force={force}`
-  - Implementation: `conn.compute.delete_server(server_id, ignore_missing=True, force=force)`
-  - Response: `204 No Content`
 
-## Authentication (Token Proxy)
-
-The API uses a token proxy approach:
-
-- Client sends a Keystone token: `Authorization: Bearer <KEYSTONE_TOKEN>`
-- The API builds a `keystoneauth1` session using the official `v3.Token(auth_url, token)` plugin
-- That session is used to build an authenticated `openstacksdk` `Connection`
-
-### Required environment variables
-
-| Variable | Required | Description |
-|---|---:|---|
-| `OPENSTACK_AUTH_URL` | Yes | Keystone v3 auth endpoint (example: `https://keystone.example.com:5000/v3`) |
-| `OPENSTACK_REGION_NAME` | No | OpenStack region (default: `RegionOne`) |
-| `OPENSTACK_COMPUTE_API_VERSION` | No | Compute API major version (default: `2`) |
-| `OPENSTACK_IDENTITY_INTERFACE` | No | Keystone interface (`internal`, `public`, or `admin`; default: `internal`) |
-| `OPENSTACK_PROJECT_ID` | No | Optional project scoping for the token plugin |
-| `OPENSTACK_USER_DOMAIN_ID` | No | Optional user domain id for token scoping |
-| `OPENSTACK_PROJECT_DOMAIN_ID` | No | Optional project domain id for token scoping |
-
-## Error Handling
-
-OpenStack SDK exceptions are mapped to HTTP responses in `app/core/errors.py`.
-
-Common mappings implemented:
-- `openstack.exceptions.NotFoundException` -> `404`
-- `openstack.exceptions.BadRequestException` -> `400`
-- `openstack.exceptions.ForbiddenException` -> `403`
-- `openstack.exceptions.ConflictException` -> `409`
-- Everything else -> `502 Bad Gateway` (operation failed or discovery/transport issues)
-
-## Local Development
+## Local development
 
 ### Install
 
 ```bash
-python -m pip install --upgrade pip
-python -m pip install -e ".[dev]"
+py -m venv .venv
+```
+
+Activate venv (PowerShell):
+
+```bash
+.\.venv\Scripts\Activate.ps1
+```
+
+Install (uses `uv`):
+
+```bash
+uv pip install -e ."
 ```
 
 ### Run
 
+Run in mock mode (default):
+
 ```bash
+set ADAPTER_MODE=mock
 uvicorn app.main:app --reload --port 8000
+```
+
+Or with Docker:
+
+```bash
+docker compose up --build
 ```
 
 ### Test
@@ -129,82 +157,88 @@ uvicorn app.main:app --reload --port 8000
 pytest
 ```
 
-The test suite overrides the OpenStack dependency (`get_vm_service`) so tests run without a live OpenStack cloud.
 
-## Request Examples
+## What’s implemented (and why it matters)
 
-### Create VM
+- **Explicit state machine (`app/core/state_machine.py`)**
+  - State transitions are validated; illegal transitions throw immediately.
+  - Avoids “stringly-typed” state bugs and makes DR decisions auditable.
+- **Job-based async DR API**
+  - `POST /v1/vms/{vm_id}/dr/trigger` returns **`202 Accepted`** with a `job_id` and a poll endpoint.
+  - **Idempotency**: triggering while a job is running returns the existing job (no duplicate pipelines).
+- **Audit trail is first-class**
+  - Every mutation (registration, health transitions, DR steps, abort requests) records an `AuditEvent`.
+  - Request correlation via `X-Request-ID` propagates into audits and logs.
+- **Retry/backoff for flaky infrastructure**
+  - Adapter operations are executed with retry logic (`app/core/retry.py`) to tolerate transient OpenStack errors.
+- **Runs end-to-end without OpenStack**
+  - `ADAPTER_MODE=mock` provides realistic latency + deterministic failure injection for tests and demos.
+- **Separation of concerns**
+  - Routers are thin; orchestration logic is isolated; adapter abstracts OpenStack vs mock.
 
-```bash
-curl -X POST "http://localhost:8000/v1/servers" \
-  -H "Authorization: Bearer $OS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "vm-1",
-    "image_id": "IMG_ID",
-    "flavor_id": "FLAVOR_ID",
-    "networks": [{"uuid":"NET_ID"}]
-  }'
-```
 
-### Start VM
+## Limitations (intentional for MVP)
 
-```bash
-curl -X POST "http://localhost:8000/v1/servers/SERVER_ID/start" \
-  -H "Authorization: Bearer $OS_TOKEN"
-```
+- **Health monitor auto-trigger is not a background scheduler yet**
+  - Health probes can be triggered via API; there is not yet a Celery beat / cron loop that checks all VMs.
+- **BackgroundTasks is not survivable across restarts**
+  - If the process restarts mid-DR, the in-flight background job is lost (DB state remains).
+- **No distributed locking**
+  - In a multi-worker deployment, two workers could trigger DR for the same VM without a lock.
+- **OpenStack “ping” is best-effort in real mode**
+  - `OpenStackAdapter.ping_vm()` currently checks server status; a real probe should hit an app port (HTTP/SSH) or a health agent.
+- **Network reroute (DNS/LB) not implemented**
+  - The orchestration focuses on snapshot/stop/boot/verify; traffic switching is a Phase 2/3 integration.
+- **Data-plane decisions are simplified**
+  - Standby selection uses a best-effort heuristic; policy/cost/affinity rules are not implemented.
 
-### Stop VM
 
-```bash
-curl -X POST "http://localhost:8000/v1/servers/SERVER_ID/stop" \
-  -H "Authorization: Bearer $OS_TOKEN"
-```
+## Future plan
 
-### Delete VM
+### Phase 2: Durable async pipeline
 
-```bash
-curl -X DELETE "http://localhost:8000/v1/servers/SERVER_ID?force=false" \
-  -H "Authorization: Bearer $OS_TOKEN"
-```
+- **Celery + Redis job runner**
+  - Replace FastAPI `BackgroundTasks` with Celery workers so DR jobs survive restarts.
+  - Keep the same HTTP contract (`202 + job_id + poll`).
+- **PostgreSQL**
+  - Swap SQLite demo DB for Postgres (`asyncpg`) in deployment.
 
-## SDLC Notes (How this was approached)
+### Phase 3: Automated detection + safety
 
-1. **Design** the endpoint contract first (HTTP methods, request/response models, and Swagger expectations).
-2. **Integrate** using the official OpenStack SDK primitives (OpenStack `Connection`, compute proxy operations, and server action methods).
-3. **Test** at the HTTP boundary with dependency overrides to avoid coupling unit tests to cloud state.
-4. **Document** operational expectations: required environment variables, token header format, and endpoint-to-SDK mapping.
+- **Scheduled health monitor**
+  - Celery beat task (or external scheduler) to run periodic probes for all registered VMs.
+  - Threshold-based transitions (HEALTHY → SUSPECT → FAILING) and auto-trigger DR.
+- **Distributed lock**
+  - Redis lock keyed by VM id so only one DR pipeline can run per VM across workers.
+- **Richer readiness/health**
+  - Add optional agent-based probes or configurable TCP/HTTP probes per VM.
 
-## Roadmap / Backlog (Beyond MVP)
+### Phase 4: Operational integrations
 
-- Add `GET /v1/servers` and `GET /v1/servers/{server_id}` for discovery UX.
-- Implement additional lifecycle actions: `reboot` (soft/hard), `resize`, and snapshot/image-based workflows.
-- Add asynchronous job tracking + action polling:
-  - record action request metadata
-  - poll server state/action events
-  - return `job_id` to callers
-- Improve idempotency semantics:
-  - handle “already started/stopped” cases explicitly
-- Add request correlation / observability:
-  - request id propagation
-  - structured logging
-  - metrics hooks
-- Add RBAC/authz boundaries:
-  - map token/project/roles to allowed actions
+- **DNS / load balancer updates**
+  - Integrate Octavia/Neutron or external DNS/LB systems to shift traffic to recovered VM.
+- **Policy engine**
+  - Per-VM rules: approval required, DR allowed windows, max cost, preferred standby pools.
+- **Observability**
+  - Metrics per state/job, RTO breach counters, dashboard-ready audit queries.
+- **Security / RBAC**
+  - Enforce role-based permissions and project scoping beyond “token proxy”.
 
-## Official Docs Used (Links)
 
-FastAPI
-- [FastAPI: Bigger Applications (APIRouter / multiple files)](https://fastapi.tiangolo.com/tutorial/bigger-applications/)
-- [FastAPI: Security with Bearer Token (Simple OAuth2 tutorial)](https://fastapi.tiangolo.com/tutorial/security/simple-oauth2/)
-- [FastAPI: Handling Errors (HTTPException)](https://fastapi.tiangolo.com/tutorial/handling-errors)
-- [FastAPI: Testing (TestClient)](https://fastapi.tiangolo.com/tutorial/testing)
+## Environment variables (high signal)
 
-OpenStack SDK + Keystone auth
-- [openstacksdk: Connection (including existing authenticated Session)](https://docs.openstack.org/openstacksdk/latest/user/connection.html)
-- [openstacksdk: Compute proxy (create/delete server operations)](https://docs.openstack.org/openstacksdk/latest/user/proxies/compute.html)
-- [openstacksdk: Server actions (start/stop/resize etc.)](https://docs.openstack.org/openstacksdk/latest/user/resources/compute/v2/server.html)
-- [openstacksdk: Exceptions mapping overview](https://docs.openstack.org/openstacksdk/latest/user/exceptions.html)
-- [keystoneauth1: Using Sessions](https://docs.openstack.org/keystoneauth/2025.1/using-sessions.html)
-- [keystoneauth1: v3 Token (existing token plugin)](https://docs.openstack.org/keystoneauth/latest/api/keystoneauth1.identity.v3.token.html)
+- `ADAPTER_MODE`: `mock` (default) or `openstack`
+- `DATABASE_URL`: defaults to SQLite in docker-compose; set for real deployments
+- `DEFAULT_RTO_MINUTES`: default RTO for newly-registered VMs
+- `MOCK_LATENCY_MS`: mock adapter latency tuning
+- `OPENSTACK_AUTH_URL`: required for `ADAPTER_MODE=openstack` token-proxy mode
+
+
+## Key references in the codebase
+
+- **API wiring**: `app/main.py`
+- **DR orchestrator**: `app/core/orchestrator.py`
+- **State machine**: `app/core/state_machine.py`
+- **Adapters**: `app/adapters/mock.py`, `app/adapters/openstack.py`, `app/adapters/factory.py`
+- **Routers**: `app/api/routers/vms.py`, `app/api/routers/dr.py`, `app/api/routers/audit.py`, `app/api/routers/health.py`, `app/api/routers/servers.py`
 

@@ -1,0 +1,56 @@
+# One-command demo: `docker compose up --build`
+#
+# Brings up the DR control plane in mock mode so reviewers can run an entire
+# snapshot -> migrate -> restore pipeline against the in-memory adapter
+# without an OpenStack cluster. SQLite state lives in a named volume so jobs
+# and audit events persist across restarts.
+#
+# Phase 2 (Celery + Redis + Postgres) sketch is included as commented stubs
+# below; uncomment to scale the same code path to a survivable deployment.
+
+services:
+  api:
+    build: .
+    image: dr-orchestrator:dev
+    ports:
+      - "8000:8000"
+    environment:
+      ADAPTER_MODE: mock
+      DATABASE_URL: sqlite+aiosqlite:////app/data/dr.db
+      DEFAULT_RTO_MINUTES: "15"
+      MOCK_LATENCY_MS: "250"
+    volumes:
+      - dr_data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/live',timeout=2).status==200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+# --- Phase 2 stubs (uncomment to migrate from BackgroundTasks/SQLite) -------
+# 
+#   redis:
+#     image: redis:7-alpine
+#     ports: ["6379:6379"]
+# 
+#   postgres:
+#     image: postgres:16-alpine
+#     environment:
+#       POSTGRES_PASSWORD: dr
+#       POSTGRES_DB: dr
+#     ports: ["5432:5432"]
+#     volumes:
+#       - dr_pg:/var/lib/postgresql/data
+# 
+#   worker:
+#     build: .
+#     command: ["celery", "-A", "app.tasks.celery_app", "worker", "-l", "INFO"]
+#     environment:
+#       ADAPTER_MODE: mock
+#       DATABASE_URL: postgresql+asyncpg://postgres:dr@postgres:5432/dr
+#       CELERY_BROKER_URL: redis://redis:6379/0
+#     depends_on: [redis, postgres]
+
+volumes:
+  dr_data:
+  # dr_pg:
