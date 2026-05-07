@@ -157,7 +157,6 @@ docker compose up --build
 pytest
 ```
 
-
 ## What’s implemented (and why it matters)
 
 - **Explicit state machine (`app/core/state_machine.py`)**

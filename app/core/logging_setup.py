@@ -12,7 +12,10 @@ import sys
 from contextvars import ContextVar
 from typing import Any
 
-from pythonjsonlogger import jsonlogger
+try:  # python-json-logger >= 3.x prefers `pythonjsonlogger.json`
+    from pythonjsonlogger.json import JsonFormatter as _JsonFormatter
+except ImportError:  # pragma: no cover - older versions
+    from pythonjsonlogger.jsonlogger import JsonFormatter as _JsonFormatter
 
 _request_id_ctx: ContextVar[str | None] = ContextVar("request_id", default=None)
 
@@ -41,7 +44,7 @@ def configure_logging(level: str = "INFO") -> None:
         "%(message)s": "message",
         "%(request_id)s": "request_id",
     }
-    formatter = jsonlogger.JsonFormatter(
+    formatter = _JsonFormatter(
         fmt=" ".join(fmt.keys()),
         rename_fields={"asctime": "ts", "levelname": "level"},
         json_default=str,
