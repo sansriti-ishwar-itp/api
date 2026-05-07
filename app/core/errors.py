@@ -87,7 +87,7 @@ def openstack_exception_to_http(exc: Exception) -> HTTPException:
         return _make(ErrorCode.ILLEGAL_STATE_TRANSITION, str(exc))
     if isinstance(exc, StandbyUnavailableError):
         return _make(ErrorCode.STANDBY_UNAVAILABLE)
-    if isinstance(exc, VMNotFoundError) or isinstance(exc, os_exc.NotFoundException):
+    if isinstance(exc, (VMNotFoundError, os_exc.NotFoundException)):
         return _make(ErrorCode.NOT_FOUND, str(exc))
     if isinstance(exc, os_exc.BadRequestException):
         return _make(ErrorCode.BAD_REQUEST, str(exc))

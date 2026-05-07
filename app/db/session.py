@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Optional
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -21,8 +20,8 @@ class Base(DeclarativeBase):
     """Single declarative base shared by all ORM models."""
 
 
-_engine: Optional[AsyncEngine] = None
-_sessionmaker: Optional[async_sessionmaker[AsyncSession]] = None
+_engine: AsyncEngine | None = None
+_sessionmaker: async_sessionmaker[AsyncSession] | None = None
 
 
 def init_engine(database_url: str | None = None) -> AsyncEngine:

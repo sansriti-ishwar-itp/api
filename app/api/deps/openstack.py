@@ -9,7 +9,7 @@ token proxy and wraps a freshly-built `OpenStackVMClient`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Annotated, Optional
+from typing import Annotated
 
 from fastapi import Depends, HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -59,7 +59,7 @@ def _token_from_credentials(credentials: HTTPAuthorizationCredentials) -> str:
 
 
 def _build_openstack_context(
-    credentials: Optional[HTTPAuthorizationCredentials],
+    credentials: HTTPAuthorizationCredentials | None,
     settings: Settings,
 ) -> OpenStackContext:
     if credentials is None:
@@ -77,7 +77,7 @@ def _build_openstack_context(
         )
     token = _token_from_credentials(credentials)
 
-    auth_kwargs: dict[str, Optional[str] | bool] = {
+    auth_kwargs: dict[str, str | None | bool] = {
         "auth_url": settings.openstack_auth_url,
         "token": token,
         "reauthenticate": True,
@@ -100,12 +100,14 @@ def _build_openstack_context(
             identity_interface=settings.openstack_identity_interface,
         )
     except ServiceDiscoveryException as e:
-        raise HTTPException(status_code=502, detail=f"OpenStack service discovery failed: {e}")
+        raise HTTPException(
+            status_code=502, detail=f"OpenStack service discovery failed: {e}"
+        ) from e
     return OpenStackContext(conn=conn, ks_session=ks_sess)
 
 
 def get_openstack_context(
-    credentials: Annotated[Optional[HTTPAuthorizationCredentials], Security(bearer_scheme)],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Security(bearer_scheme)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> OpenStackContext:
     """Legacy dependency for `/v1/servers/*` routes (always requires a token)."""
@@ -118,7 +120,7 @@ def get_vm_service(ctx: OpenStackContext = Depends(get_openstack_context)) -> VM
 
 
 def get_vm_adapter(
-    credentials: Annotated[Optional[HTTPAuthorizationCredentials], Security(bearer_scheme)],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Security(bearer_scheme)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> VMAdapter:
     """Adapter dependency for `/v1/vms/*` and `/v1/dr/*` routes.

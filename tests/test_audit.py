@@ -6,8 +6,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.audit import AuditService
 from app.core.state_machine import VMState
-from app.db.session import Base
 from app.db.models import VM, AuditEvent
+from app.db.session import Base
 
 
 @pytest.fixture()

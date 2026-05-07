@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from app.adapters.base import VMAdapter
 from app.adapters.mock import MockAdapter
 from app.adapters.openstack import OpenStackAdapter
 from app.core.config import Settings, get_settings
 from app.services.openstack_client import OpenStackVMClient
 
-_mock_singleton: Optional[MockAdapter] = None
+_mock_singleton: MockAdapter | None = None
 
 
 def _get_or_create_mock(latency_ms: int) -> MockAdapter:

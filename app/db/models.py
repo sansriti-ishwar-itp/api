@@ -22,7 +22,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.state_machine import VMState
 from app.db.session import Base
 
-
 _VMStateEnum = Enum(
     VMState,
     name="vm_state",
@@ -60,16 +59,16 @@ class VM(Base):
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
     )
 
-    audit_events: Mapped[list["AuditEvent"]] = relationship(
+    audit_events: Mapped[list[AuditEvent]] = relationship(
         back_populates="vm", cascade="all, delete-orphan"
     )
-    dr_jobs: Mapped[list["DRJob"]] = relationship(
+    dr_jobs: Mapped[list[DRJob]] = relationship(
         back_populates="vm", cascade="all, delete-orphan"
     )
-    snapshots: Mapped[list["Snapshot"]] = relationship(
+    snapshots: Mapped[list[Snapshot]] = relationship(
         back_populates="vm", cascade="all, delete-orphan"
     )
-    health_checks: Mapped[list["HealthCheck"]] = relationship(
+    health_checks: Mapped[list[HealthCheck]] = relationship(
         back_populates="vm", cascade="all, delete-orphan"
     )
 

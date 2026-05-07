@@ -55,7 +55,8 @@ async def with_retry(
                 )
                 return await func(*args, **kwargs)
     except RetryError as exc:  # pragma: no cover - reraise=True bypasses this
-        if exc.last_attempt and exc.last_attempt.exception() is not None:
-            raise exc.last_attempt.exception()  # type: ignore[misc]
+        last = exc.last_attempt.exception() if exc.last_attempt else None
+        if last is not None:
+            raise last from exc
         raise
     raise RuntimeError(f"retry loop exited without result for {label}")  # pragma: no cover

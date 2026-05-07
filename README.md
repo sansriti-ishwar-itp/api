@@ -4,17 +4,76 @@ Automates disaster-recovery (DR) decisioning and execution for OpenStack VMs usi
 
 This repo includes:
 - A **DR control plane** (`/v1/vms`, `/v1/dr/*`, `/v1/audit`) that tracks VMs, health probes, snapshots, and DR jobs.
-- A **raw OpenStack lifecycle** router (`/v1/servers`) that proxies a Keystone bearer token to OpenStack for create/start/stop/delete.
+- A **OpenStack lifecycle** router (`/v1/servers`) that proxies a Keystone bearer token to OpenStack for create/start/stop/delete.
 - A **mock adapter** for end-to-end local runs without OpenStack.
 
 
 ## Problem statement
 
-Enterprises running large OpenStack fleets often recover VMs manually:
-- Alerts arrive late, triage is manual, and recovery steps are error-prone (snapshot, stop, boot on standby, validate).
-- Downtime is typically **45–90 minutes**, but common SLAs require **~15 minutes** RTO.
+An enterprise runs **200+ VMs on a private cloud** — build agents, internal services, ML notebooks, customer workloads. When one fails (hardware fault, resource exhaustion, hypervisor crash, network partition) the recovery runbook today is **manual**:
 
-**Goal:** Provide an automated DR pipeline that detects failures, drives a VM through recovery states, records an audit trail for every step, and exposes a safe async API for operators/integrations.
+1. Notice the alert — typically a **5–15 minute lag** before a human looks at it.
+2. SSH in, triage what's actually broken.
+3. Manually snapshot the disk, stop the source VM, boot a copy on a standby compute host.
+4. Verify the new VM is reachable; update DNS / load balancer; tell the on-call channel.
+
+**Result: 45–90 minutes of downtime. The SLA promises 15 minutes.** Every breach is a customer-visible incident, an audit finding, and an on-call burnout multiplier.
+
+### Why a REST API is the right shape
+
+The fix is not "more dashboards" — it's an **opinionated control plane** that turns the runbook into a small, auditable, async API. The lifecycle maps cleanly to endpoints:
+
+| Step in the runbook | API surface |
+|---|---|
+| Detect failure | `POST /v1/vms/{id}/health-check` (manual now; Celery-beat in Phase 2) |
+| Capture state | `POST /v1/vms/{id}/snapshot` |
+| Drive recovery | `POST /v1/vms/{id}/dr/trigger` → `202 Accepted` + `job_id` |
+| Track progress | `GET /v1/dr/jobs/{job_id}` (SLA remaining, current state) |
+| Prove what happened | `GET /v1/vms/{id}/audit`, `GET /v1/audit` |
+
+Behind those endpoints sits the actual `snapshot → stop → migrate → boot → verify` pipeline, executed as an async job with retry/backoff against transient OpenStack errors.
+
+**Phase 1 — this iteration (delivered):**
+
+| Capability | What's delivered |
+|---|---|
+| Runbook mapped to API endpoints | Lifecycle + DR jobs + audit endpoints across `/v1/vms` and `/v1/dr/*` |
+| Explicit VM state machine | `HEALTHY → SUSPECT → FAILING → SNAPSHOTTING → MIGRATING → RESTORING → RECOVERED \| FAILED` with illegal transitions rejected |
+| DR orchestrator | `snapshot → stop → migrate → boot → verify` pipeline with per-step retry + state persistence |
+| Async job model | `POST /dr/trigger` returns `202 Accepted` + `job_id`; poll via `GET /dr/jobs/{id}` |
+| Idempotent triggers (in-flight) | Re-triggering an in-flight DR returns the existing `job_id` instead of duplicating |
+| Per-job SLA / RTO tracking | `SLATracker` records elapsed + RTO-remaining on every poll |
+| Atomic audit trail | Every state change writes `AuditEvent` in the same DB transaction (no torn states) |
+| Request correlation | `X-Request-ID` middleware propagates into structured JSON logs and audit rows |
+| Adapter abstraction | `VMAdapter` Protocol with `MockAdapter` (default) and `OpenStackAdapter` (real Nova/Glance) |
+| Local demo without OpenStack | `ADAPTER_MODE=mock` runs the full pipeline end-to-end |
+| Persistence | SQLite via async SQLAlchemy (`aiosqlite`) — same API as Postgres for Phase 2 |
+| Containerized | Multi-stage `Dockerfile` (non-root, healthcheck) + `docker-compose.yml` |
+| Observability hooks | Structured JSON logs + Prometheus `/metrics` |
+| Stable error envelope | `{ "error": { "code", "message", "request_id" } }` with sanitized 5xx |
+| Test suite | 48 tests across state machine, orchestrator, adapter, audit, and HTTP layer |
+
+**Phase 2 — robustness & survivability:**
+
+| Capability | This iteration | Phase 2 enhancement |
+|---|---|---|
+| Survivable async pipeline | FastAPI `BackgroundTasks` (in-process) | Celery + Redis workers (jobs survive restarts) |
+| Persistence | SQLite via `aiosqlite` | Postgres via `DATABASE_URL` swap |
+| Survive transient OpenStack failures | Retry with exponential backoff (`tenacity`) | Add circuit breaker (`pybreaker`) |
+| Idempotent long-running ops | `job_id` + in-flight replay on `dr/trigger` | Full `Idempotency-Key` header (Redis-backed) |
+| Per-job SLA / RTO tracking | `SLATracker` per job, surfaced on poll | RTO-breach alerts to Slack / PagerDuty |
+| Auto-detect failures (no human in loop) | Manual `POST /health-check` endpoint | Celery-beat scheduler + Redis distributed lock |
+
+**Phase 3 — production-readiness:**
+
+| Capability | This iteration | Phase 3 enhancement |
+|---|---|---|
+| Auditable trail of every decision | Atomic state + `AuditEvent` (DB) | WORM storage + signed audit hashes |
+| Production-grade auth / RBAC | Keystone bearer (real mode only) | OIDC for callers + API-layer RBAC |
+| Traffic re-route after recovery | Out of scope | Octavia / external DNS integration |
+| Distributed tracing | Structured JSON logs + `/metrics` | OpenTelemetry across FastAPI → openstacksdk |
+| Deployment | Dockerfile + `docker-compose` | Helm chart with HPA / PDB / NetworkPolicy |
+| Failover scope | Standby compute host (same region) | Cross-region failover with cost-aware standby selection |
 
 
 ## Architecture diagram
@@ -121,27 +180,26 @@ These require `Authorization: Bearer <KEYSTONE_TOKEN>`:
 ### Install
 
 ```bash
-py -m venv .venv
-```
+# 1. Create and activate a virtualenv
+python -m venv .venv
 
-Activate venv (PowerShell):
-
-```bash
+# Windows (PowerShell)
 .\.venv\Scripts\Activate.ps1
-```
 
-Install (uses `uv`):
+# macOS / Linux
+source .venv/bin/activate
 
-```bash
-uv pip install -e ."
+# 2. Install the project + dev tooling (pytest, ruff, black, mypy)
+pip install -e ".[dev]"
 ```
 
 ### Run
 
-Run in mock mode (default):
+Mock mode (default — no OpenStack required):
 
 ```bash
-set ADAPTER_MODE=mock
+# Windows (PowerShell):  $env:ADAPTER_MODE = "mock"
+# macOS / Linux:         export ADAPTER_MODE=mock
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -151,29 +209,60 @@ Or with Docker:
 docker compose up --build
 ```
 
+### Try it end-to-end (mock mode)
+
+Once the server is up, this sequence registers a VM, triggers a DR pipeline, and polls the job to completion — entirely against the mock adapter.
+
+> **See [docs/SAMPLE_RUN.md](docs/SAMPLE_RUN.md)** for a verbatim PowerShell transcript of this flow against the mock adapter, including the DR job response, the full audit trail, and an annotated timeline showing how the state machine and `X-Request-ID` correlation behave end-to-end.
+
+**Windows (PowerShell):**
+
+```powershell
+# 1. Register a VM for DR monitoring
+$body = @{ name = "build-agent-7"; external_id = "ext-build-7"; rto_minutes = 15 } | ConvertTo-Json
+$vm   = Invoke-RestMethod -Method Post -Uri http://localhost:8000/v1/vms `
+          -ContentType 'application/json' -Body $body
+$vmId = $vm.id
+
+# 2. Trigger the DR pipeline (returns 202 + job_id)
+$job   = Invoke-RestMethod -Method Post -Uri "http://localhost:8000/v1/vms/$vmId/dr/trigger" `
+            -ContentType 'application/json' -Body '{}'
+$jobId = $job.id
+
+# 3. Poll the job to completion
+Invoke-RestMethod -Uri "http://localhost:8000/v1/dr/jobs/$jobId" | ConvertTo-Json -Depth 10
+
+# 4. Inspect the audit trail
+Invoke-RestMethod -Uri "http://localhost:8000/v1/vms/$vmId/audit" | ConvertTo-Json -Depth 10
+```
+
 ### Test
 
 ```bash
-pytest
+pytest                                  # full suite (48 tests)
 ```
 
-## What’s implemented (and why it matters)
+## Design choices & trade-offs
 
-- **Explicit state machine (`app/core/state_machine.py`)**
-  - State transitions are validated; illegal transitions throw immediately.
-  - Avoids “stringly-typed” state bugs and makes DR decisions auditable.
-- **Job-based async DR API**
-  - `POST /v1/vms/{vm_id}/dr/trigger` returns **`202 Accepted`** with a `job_id` and a poll endpoint.
-  - **Idempotency**: triggering while a job is running returns the existing job (no duplicate pipelines).
-- **Audit trail is first-class**
-  - Every mutation (registration, health transitions, DR steps, abort requests) records an `AuditEvent`.
-  - Request correlation via `X-Request-ID` propagates into audits and logs.
-- **Retry/backoff for flaky infrastructure**
-  - Adapter operations are executed with retry logic (`app/core/retry.py`) to tolerate transient OpenStack errors.
-- **Runs end-to-end without OpenStack**
-  - `ADAPTER_MODE=mock` provides realistic latency + deterministic failure injection for tests and demos.
-- **Separation of concerns**
-  - Routers are thin; orchestration logic is isolated; adapter abstracts OpenStack vs mock.
+Each decision below is named with the alternative considered and the trade-off behind the choice.
+
+### 1. Explicit state machine over free-form status strings
+Recovery has eight states with strict ordering. A passthrough `status: str` field would have been faster but invites bugs like *"snapshotting a recovered VM"* or *"recovered without restoring"*. Encoding states as a `VMState` enum with a `TRANSITIONS` table makes illegal transitions unrepresentable and makes audit rows query-friendly (`from_state`, `to_state`).
+
+### 2. Async job model (`202 + job_id`) over a blocking `POST`
+A DR pipeline takes minutes, not milliseconds. A blocking `POST` would tie up workers, time out at proxies, and cause the client to retry — creating duplicate pipelines. Returning `202 Accepted` + `Location: /v1/dr/jobs/{id}` decouples the request from the work, lets the caller poll, abort, or retry safely, and is the standard for any operation that doesn't fit in a single HTTP timeout.
+
+### 3. Adapter Protocol with mock + real implementations
+The platform must be runnable end-to-end without provisioning OpenStack. The `VMAdapter` Protocol lets `MockAdapter` (in-memory, deterministic, latency-tunable) and `OpenStackAdapter` (real `openstacksdk` calls via `asyncio.to_thread`) coexist behind the same orchestrator. Cost: duplicated method signatures. Benefit: the orchestrator is 100% testable with zero infra.
+
+### 4. State + audit written in one transaction
+Every state mutation in `DROrchestrator._step` writes the VM row update *and* the `AuditEvent` in the same `AsyncSession.commit()`. If anything throws between them, neither is persisted — there's no such thing as a state change without an audit row, or vice versa. This is the property compliance auditors care about most.
+
+### 5. `BackgroundTasks` (not Celery) for the MVP
+Celery + Redis is the right answer for production. At the MVP stage it adds two services without changing the HTTP contract, so the cost outweighs the benefit. The `_run_pipeline` callsite is a single function, which keeps the Phase 2 swap to one file. **Honest cost:** a process restart loses an in-flight pipeline; the `DRJob` row remains, so the orphan is detectable and the operator can re-trigger.
+
+### 6. Sanitized error envelope with stable codes
+4xx responses forward the provider message (caller-actionable). 5xx responses return only `{ "error": { "code": "...", "message": "...", "request_id": "..." } }` with a default message — raw OpenStack tracebacks are logged but never leak in the response body. CI/CD pipelines branch on `code`; humans correlate via `request_id` in logs.
 
 
 ## Limitations (intentional for MVP)
@@ -192,36 +281,28 @@ pytest
   - Standby selection uses a best-effort heuristic; policy/cost/affinity rules are not implemented.
 
 
-## Future plan
+## Roadmap detail
 
-### Phase 2: Durable async pipeline
+The Phase 2 and Phase 3 tables earlier summarize *what* changes; the items below add the *how* and *why* for each phase.
 
-- **Celery + Redis job runner**
-  - Replace FastAPI `BackgroundTasks` with Celery workers so DR jobs survive restarts.
-  - Keep the same HTTP contract (`202 + job_id + poll`).
-- **PostgreSQL**
-  - Swap SQLite demo DB for Postgres (`asyncpg`) in deployment.
+### Phase 2 — robustness & survivability
 
-### Phase 3: Automated detection + safety
+- **Survivable async pipeline.** Replace FastAPI `BackgroundTasks` with Celery workers so DR jobs survive process restarts. Same HTTP contract (`202 + job_id + poll`).
+- **Postgres.** Swap SQLite for `asyncpg` in deployment; same async SQLAlchemy API.
+- **Auto-detection.** Celery-beat task probes every registered VM on a schedule; threshold-based transitions (`HEALTHY → SUSPECT → FAILING`) auto-trigger DR.
+- **Distributed lock.** Redis lock keyed by VM id so only one DR pipeline can run per VM across workers.
+- **Richer probes.** Pluggable TCP/HTTP/agent-based probes per VM, not just "Nova thinks it's `ACTIVE`".
+- **Reliability.** Circuit breaker (`pybreaker`) in front of OpenStack calls; full `Idempotency-Key` header for any mutation.
 
-- **Scheduled health monitor**
-  - Celery beat task (or external scheduler) to run periodic probes for all registered VMs.
-  - Threshold-based transitions (HEALTHY → SUSPECT → FAILING) and auto-trigger DR.
-- **Distributed lock**
-  - Redis lock keyed by VM id so only one DR pipeline can run per VM across workers.
-- **Richer readiness/health**
-  - Add optional agent-based probes or configurable TCP/HTTP probes per VM.
+### Phase 3 — production-readiness
 
-### Phase 4: Operational integrations
-
-- **DNS / load balancer updates**
-  - Integrate Octavia/Neutron or external DNS/LB systems to shift traffic to recovered VM.
-- **Policy engine**
-  - Per-VM rules: approval required, DR allowed windows, max cost, preferred standby pools.
-- **Observability**
-  - Metrics per state/job, RTO breach counters, dashboard-ready audit queries.
-- **Security / RBAC**
-  - Enforce role-based permissions and project scoping beyond “token proxy”.
+- **DNS / load balancer rerouting.** Integrate Octavia/Neutron (or external DNS/LB) to actually shift traffic to the recovered VM.
+- **Policy engine.** Per-VM rules — approval gates, DR-allowed time windows, max cost per recovery, preferred standby pools, cost-aware standby selection.
+- **Auth & RBAC.** OIDC for human callers, application credentials for service-to-service, API-layer role checks beyond what Keystone enforces.
+- **Tracing.** OpenTelemetry across FastAPI → openstacksdk so a span shows *"this DR was slow because Nova was slow"*.
+- **Audit hardening.** WORM storage, signed audit hashes, per-action subject (token `sub`) on every event.
+- **Cross-region failover** instead of just a standby compute host.
+- **Helm chart** with HPA, PDB, NetworkPolicy, ServiceMonitor, ExternalSecrets.
 
 
 ## Environment variables (high signal)

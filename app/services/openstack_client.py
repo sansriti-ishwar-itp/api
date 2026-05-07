@@ -5,6 +5,7 @@ from typing import Any
 from keystoneauth1 import session as ks_session
 from openstack.connection import Connection
 
+
 # Actual openstack sdk calls
 class OpenStackVMClient:
     """

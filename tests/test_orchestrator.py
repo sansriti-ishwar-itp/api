@@ -15,8 +15,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.adapters.mock import MockAdapter
 from app.core.orchestrator import DROrchestrator
 from app.core.state_machine import VMState
-from app.db.session import Base
 from app.db.models import VM, AuditEvent, DRJob
+from app.db.session import Base
 
 
 @pytest.fixture()
